@@ -454,13 +454,30 @@ static HEVCFrame *generate_missing_ref(HEVCContext *s, HEVCLayerContext *l, int 
 
 /* add a reference with the given poc to the list and mark it as used in DPB */
 static int add_candidate_ref(HEVCContext *s, HEVCLayerContext *l,
-                             RefPicList *list,
+                             RefPicList *list, int list_idx,
                              int poc, int ref_flag, uint8_t use_msb)
 {
     HEVCFrame *ref = find_ref_idx(s, l, poc, use_msb);
 
     if (ref == s->cur_frame || list->nb_refs >= HEVC_MAX_REFS)
         return AVERROR_INVALIDDATA;
+
+    /* Backport of upstream commit bc1a3bfd ("avcodec/hevc: Add support for
+     * output_corrupt/showall flags"), reduced to what exists in 7.1: for a
+     * non-IRAP picture, a missing/unavailable reference that the current
+     * picture actually uses (i.e. not a *_FOLL list) means the picture cannot
+     * be decoded correctly, so drop it by default instead of feeding a
+     * fabricated reference to the decoder. Without this, generate_missing_ref()
+     * hands the hardware accelerator an uninitialized surface, which D3D11VA
+     * decodes into a green frame (and reports 0x80070057). The old behaviour is
+     * kept only when the caller explicitly asks for corrupt/all output. */
+    if (!IS_IRAP(s) && list_idx != ST_FOLL && list_idx != LT_FOLL) {
+        int ref_corrupt = !ref || (ref->flags & HEVC_FRAME_FLAG_UNAVAILABLE);
+        if (ref_corrupt &&
+            !(s->avctx->flags  & AV_CODEC_FLAG_OUTPUT_CORRUPT) &&
+            !(s->avctx->flags2 & AV_CODEC_FLAG2_SHOW_ALL))
+            return AVERROR_INVALIDDATA;
+    }
 
     if (!ref) {
         ref = generate_missing_ref(s, l, poc);
@@ -513,7 +530,7 @@ int ff_hevc_frame_rps(HEVCContext *s, HEVCLayerContext *l)
         else
             list = ST_CURR_AFT;
 
-        ret = add_candidate_ref(s, l, &rps[list], poc,
+        ret = add_candidate_ref(s, l, &rps[list], list, poc,
                                 HEVC_FRAME_FLAG_SHORT_REF, 1);
         if (ret < 0)
             goto fail;
@@ -524,7 +541,7 @@ int ff_hevc_frame_rps(HEVCContext *s, HEVCLayerContext *l)
         int poc  = long_rps->poc[i];
         int list = long_rps->used[i] ? LT_CURR : LT_FOLL;
 
-        ret = add_candidate_ref(s, l, &rps[list], poc,
+        ret = add_candidate_ref(s, l, &rps[list], list, poc,
                                 HEVC_FRAME_FLAG_LONG_REF, long_rps->poc_msb_present[i]);
         if (ret < 0)
             goto fail;
@@ -541,7 +558,7 @@ inter_layer:
          * always 1, so only RefPicSetInterLayer0 can ever contain a frame. */
         if (l0->cur_frame) {
             // inter-layer refs are treated as short-term here, cf. F.8.1.6
-            ret = add_candidate_ref(s, l0, &rps[INTER_LAYER0], l0->cur_frame->poc,
+            ret = add_candidate_ref(s, l0, &rps[INTER_LAYER0], INTER_LAYER0, l0->cur_frame->poc,
                                     HEVC_FRAME_FLAG_SHORT_REF, 1);
             if (ret < 0)
                 goto fail;
